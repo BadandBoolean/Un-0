@@ -1,0 +1,96 @@
+"""Shared helpers for the training, evaluation, and inference entry points.
+
+Plain functions with no model- or dataset-specific assumptions, kept here so the
+entry-point scripts do not import from one another (an evaluation tool importing
+from a training script reads backwards). `save_sample_grid` defaults to the
+CIFAR-10 layout (`image_size=32`, `nrow=10`); the ImageNet path passes its own
+`image_size` and uses a 10-class grid slice.
+"""
+
+from __future__ import annotations
+
+from contextlib import AbstractContextManager
+from pathlib import Path
+import random
+from typing import Literal
+
+import torch
+from torch import Tensor
+from torchvision.utils import save_image
+
+Precision = Literal["fp32", "tf32", "bf16", "fp16"]
+
+
+def seed_everything(seed: int) -> None:
+    """Seed Python and PyTorch RNGs."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(device: str) -> torch.device:
+    """Resolve `auto` to CUDA when available."""
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device)
+
+
+def save_sample_grid(
+    samples: Tensor,
+    path: str | Path,
+    *,
+    image_size: int = 32,
+    nrow: int = 10,
+) -> None:
+    """Save flattened `[-1, 1]` generated samples as an image grid."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    images = (
+        samples.detach()
+        .cpu()
+        .reshape(samples.shape[0], 3, image_size, image_size)
+    )
+    save_image(((images + 1.0) * 0.5).clamp(0.0, 1.0), output_path, nrow=nrow)
+
+
+def linear_warmup_decay_multiplier(
+    step: int,
+    *,
+    total_steps: int,
+    warmup_fraction: float,
+) -> float:
+    """Return linear warmup then linear decay multiplier."""
+    if total_steps <= 0:
+        return 1.0
+    warmup_steps = max(1, int(total_steps * warmup_fraction))
+    if step < warmup_steps:
+        return float(step + 1) / float(warmup_steps)
+    remaining = max(1, total_steps - warmup_steps)
+    progress = float(step - warmup_steps) / float(remaining)
+    return max(0.0, 1.0 - progress)
+
+
+def autocast_context(
+    device: torch.device, precision: Precision
+) -> AbstractContextManager:
+    """Return the autocast context for the requested precision."""
+    enabled = precision in ("bf16", "fp16")
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    return torch.amp.autocast(device.type, enabled=enabled, dtype=dtype)
+
+
+def make_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_steps: int,
+    warmup_fraction: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Create the linear warmup then linear decay scheduler."""
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: linear_warmup_decay_multiplier(
+            step,
+            total_steps=total_steps,
+            warmup_fraction=warmup_fraction,
+        ),
+    )

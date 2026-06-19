@@ -1,0 +1,642 @@
+"""Class-conditional Kuramoto implicit image generator (CIFAR-10)."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+import inspect
+from typing import Literal
+
+import torch
+from torch import Tensor, nn
+from torchdiffeq import odeint
+
+Encoding = Literal["raw", "sin", "sin_cos"]
+Relativization = Literal[
+    "absolute", "mean_relative", "ref_oscillator", "pairwise"
+]
+Parameterization = Literal["standard", "mup"]
+Solver = Literal["euler", "rk4"]
+
+
+def _kuramoto_velocity(
+    theta: Tensor, omega: Tensor, coupling: Tensor
+) -> Tensor:
+    """Kuramoto phase velocity: dθ/dt = ω + cos(θ) · (sin(θ) @ Kᵀ) − sin(θ) · (cos(θ) @ Kᵀ)."""
+    sin_theta = torch.sin(theta)
+    cos_theta = torch.cos(theta)
+    weighted_sin = sin_theta @ coupling.transpose(-1, -2)
+    weighted_cos = cos_theta @ coupling.transpose(-1, -2)
+    return omega + cos_theta * weighted_sin - sin_theta * weighted_cos
+
+
+class ConditionalKuramotoDynamics(nn.Module):
+    """Class-conditional Kuramoto dynamics.
+
+    Two coupled Kuramoto blocks with a class-dependent one-way drive:
+
+      * Main block: `n` oscillators with coupling `K` (shape `(n, n)`)
+        and natural frequencies `omega` (shape `(1, n)`).
+      * Conditioning block: `n_cond` oscillators with coupling `K_cond`
+        (shape `(n_cond, n_cond)`) and frequencies `omega_cond`.
+      * Class drive: `K_drive` of shape `(num_classes, n, n_cond)`
+        couples the cond block into the main block with per-class weights.
+        The main block does NOT feed back into the cond block.
+
+    For a batch element with class label `c` and joint phase state
+    `theta = [theta_main; theta_cond]`, the velocity is::
+
+        dtheta_main/dt = omega
+            + cos(theta_main) * (sin(theta_main) @ K.T)
+            - sin(theta_main) * (cos(theta_main) @ K.T)
+            + cos(theta_main) * (K_drive[c] @ sin(theta_cond))
+            - sin(theta_main) * (K_drive[c] @ cos(theta_cond))
+
+        dtheta_cond/dt = omega_cond
+            + cos(theta_cond) * (sin(theta_cond) @ K_cond.T)
+            - sin(theta_cond) * (cos(theta_cond) @ K_cond.T)
+
+    This is the standard Kuramoto term `sum_j K_ij sin(theta_j - theta_i)`
+    expanded via the angle-difference identity so it becomes two matmuls per
+    block instead of an outer product per batch element.
+
+    Diagonals of `K` and `K_cond` are zeroed on every forward so
+    oscillators don't self-couple. Class dropout: with probability
+    `class_dropout_prob`, `K_drive[c]` is zeroed for a batch element
+    during training, so the model also learns unconditional generation
+    (classifier-free-guidance style). Readout takes the first `n` phases.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_oscillators: int,
+        n_conditional_oscillators: int,
+        num_classes: int,
+        init_k_scale: float = 1.0,
+        init_freq_scale: float = 1.0,
+        parameterization: Parameterization = "standard",
+    ) -> None:
+        """Initialize conditional Kuramoto dynamics."""
+        super().__init__()
+        if n_oscillators < 2 or n_conditional_oscillators < 1 or num_classes < 1:
+            raise ValueError(
+                "Need n_oscillators >= 2, n_conditional_oscillators >= 1, "
+                "num_classes >= 1."
+            )
+        if parameterization not in ("standard", "mup"):
+            raise ValueError(
+                f"parameterization must be 'standard' or 'mup', "
+                f"got {parameterization!r}."
+            )
+
+        self.n = int(n_oscillators)
+        self.n_cond = int(n_conditional_oscillators)
+        self.num_classes = int(num_classes)
+        self.parameterization = parameterization
+
+        if parameterization == "mup":
+            self._K_scale = self.n**-0.5
+            self._K_cond_scale = self.n_cond**-0.5
+            self._K_drive_scale = self.n_cond**-0.5
+            k_init_scale = 1.0
+            k_cond_init_scale = 1.0
+            k_drive_init_scale = 1.0
+        else:
+            self._K_scale = 1.0
+            self._K_cond_scale = 1.0
+            self._K_drive_scale = 1.0
+            k_init_scale = self.n**-0.5
+            k_cond_init_scale = self.n_cond**-0.5
+            k_drive_init_scale = self.n_cond**-0.5
+
+        self.omega = nn.Parameter(init_freq_scale * torch.randn(1, self.n))
+        K_init = (
+            init_k_scale * k_init_scale * torch.randn(self.n, self.n)
+        )
+        K_init.fill_diagonal_(0.0)
+        self.K = nn.Parameter(K_init)
+
+        self.omega_cond = nn.Parameter(
+            init_freq_scale * torch.randn(1, self.n_cond)
+        )
+        K_cond_init = (
+            init_k_scale
+            * k_cond_init_scale
+            * torch.randn(self.n_cond, self.n_cond)
+        )
+        K_cond_init.fill_diagonal_(0.0)
+        self.K_cond = nn.Parameter(K_cond_init)
+
+        self.K_drive = nn.Parameter(
+            init_k_scale
+            * k_drive_init_scale
+            * torch.randn(self.num_classes, self.n, self.n_cond)
+        )
+
+    @property
+    def state_dim(self) -> int:
+        """Total state dimension (main + cond)."""
+        return self.n + self.n_cond
+
+    def forward(self, state: Tensor, _time: Tensor, drive: Tensor) -> Tensor:
+        """Compute dstate/dt for concatenated (main, cond) phases.
+
+        Args:
+            state: Concatenated phases shaped `(batch, n + n_cond)`.
+            _time: Unused (required by torchdiffeq signature).
+            drive: Per-sample drive matrix shaped `(batch, n, n_cond)`
+                (typically `K_drive[class_id]` with optional zeroing for
+                class dropout).
+        """
+        theta_main = state[:, : self.n]
+        theta_cond = state[:, self.n :]
+
+        # Subtract the learned diagonal so oscillators don't self-couple.
+        # Gradient matches masked_fill: zero on diagonal, full off-diagonal.
+        K = (self.K - torch.diag_embed(self.K.diagonal())) * self._K_scale
+        K_cond = (
+            self.K_cond - torch.diag_embed(self.K_cond.diagonal())
+        ) * self._K_cond_scale
+
+        main_vel = _kuramoto_velocity(theta_main, self.omega, K)
+        cond_vel = _kuramoto_velocity(theta_cond, self.omega_cond, K_cond)
+
+        sin_c = torch.sin(theta_cond)
+        cos_c = torch.cos(theta_cond)
+        sin_m = torch.sin(theta_main)
+        cos_m = torch.cos(theta_main)
+        drive = drive * self._K_drive_scale
+        drive_sin = torch.einsum("bnm,bm->bn", drive, sin_c)
+        drive_cos = torch.einsum("bnm,bm->bn", drive, cos_c)
+        main_vel = main_vel + cos_m * drive_sin - sin_m * drive_cos
+
+        return torch.cat([main_vel, cond_vel], dim=1)
+
+
+class ReadoutTransform(nn.Module):
+    """Map raw oscillator phases to decoder features."""
+
+    def __init__(
+        self,
+        *,
+        encoding: Encoding = "sin_cos",
+        relativization: Relativization = "ref_oscillator",
+    ) -> None:
+        """Initialize the transform."""
+        super().__init__()
+        if encoding not in ("raw", "sin", "sin_cos"):
+            raise ValueError(f"Invalid encoding: {encoding!r}.")
+        if relativization not in (
+            "absolute",
+            "mean_relative",
+            "ref_oscillator",
+            "pairwise",
+        ):
+            raise ValueError(f"Invalid relativization: {relativization!r}.")
+        self.encoding = encoding
+        self.relativization = relativization
+
+    def forward(self, phases: Tensor) -> Tensor:
+        """Transform raw phases shaped `(batch, n)` to features."""
+        if self.relativization == "mean_relative":
+            phases = phases - phases.mean(dim=-1, keepdim=True)
+        elif self.relativization == "ref_oscillator":
+            phases = phases - phases[:, :1]
+        elif self.relativization == "pairwise":
+            diff = phases.unsqueeze(-1) - phases.unsqueeze(-2)
+            phases = diff.reshape(phases.shape[0], -1)
+
+        if self.encoding == "sin":
+            return torch.sin(phases)
+        if self.encoding == "sin_cos":
+            return torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)
+        return phases
+
+
+class ResizeConvBlock(nn.Module):
+    """Nearest-neighbor upsample followed by two convolutions."""
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        """Initialize the block."""
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Upsample(scale_factor=2.0, mode="nearest"),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Apply the upsampling block."""
+        return self.net(x)
+
+
+class ResizeConvDecoder(nn.Module):
+    """Decode flat features to flattened images via resize convolutions."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        output_dim: int,
+        *,
+        in_channels: int,
+        in_height: int,
+        in_width: int,
+        out_channels: int = 3,
+        num_upsamples: int = 3,
+        final_activation: Literal["tanh", "none"] = "tanh",
+        init_output_gain: float = 0.5,
+    ) -> None:
+        """Initialize the decoder."""
+        super().__init__()
+        if feature_dim != in_channels * in_height * in_width:
+            raise ValueError(
+                "feature_dim must match in_channels * in_height * in_width. "
+                f"Got {feature_dim} and "
+                f"{in_channels} * {in_height} * {in_width}."
+            )
+        height = in_height * (2**num_upsamples)
+        width = in_width * (2**num_upsamples)
+        expected_output_dim = out_channels * height * width
+        if output_dim != expected_output_dim:
+            raise ValueError(
+                f"output_dim must be {expected_output_dim}, got {output_dim}."
+            )
+        if final_activation not in ("tanh", "none"):
+            raise ValueError(f"Invalid final_activation: {final_activation!r}.")
+
+        self.feature_dim = int(feature_dim)
+        self.output_dim = int(output_dim)
+        self.in_channels = int(in_channels)
+        self.in_height = int(in_height)
+        self.in_width = int(in_width)
+        self.out_channels = int(out_channels)
+        self.final_activation = final_activation
+
+        blocks: list[nn.Module] = []
+        current_channels = self.in_channels
+        for _ in range(num_upsamples):
+            next_channels = max(current_channels // 2, 32)
+            blocks.append(ResizeConvBlock(current_channels, next_channels))
+            current_channels = next_channels
+
+        self.cascade = nn.Sequential(*blocks)
+        self.to_output = nn.Conv2d(
+            current_channels, self.out_channels, kernel_size=3, padding=1
+        )
+        self._init_weights(init_output_gain=init_output_gain)
+
+    def _init_weights(self, *, init_output_gain: float) -> None:
+        """Initialize convolution weights."""
+        for module in self.cascade.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    module.weight, a=0.2, nonlinearity="leaky_relu",
+                )
+                nn.init.zeros_(module.bias)
+        nn.init.xavier_normal_(
+            self.to_output.weight,
+            gain=nn.init.calculate_gain("tanh") * float(init_output_gain),
+        )
+        nn.init.zeros_(self.to_output.bias)
+
+    def forward(self, features: Tensor) -> Tensor:
+        """Decode features shaped `(batch, feature_dim)`."""
+        x = features.reshape(
+            features.shape[0], self.in_channels, self.in_height, self.in_width
+        )
+        x = self.to_output(self.cascade(x))
+        if self.final_activation == "tanh":
+            x = torch.tanh(x)
+        return x.reshape(features.shape[0], self.output_dim)
+
+
+class ConditionalImplicitKuramotoGenerator(nn.Module):
+    """End-to-end class-conditional Kuramoto image generator."""
+
+    def __init__(
+        self,
+        *,
+        dynamics: nn.Module,
+        readout: ReadoutTransform,
+        decoder: nn.Module,
+        class_dropout_prob: float = 0.0,
+        integration_time: float = 1.0,
+        num_steps: int = 25,
+        solver: Solver = "rk4",
+    ) -> None:
+        """Initialize the generator."""
+        super().__init__()
+        if num_steps < 0:
+            raise ValueError(f"num_steps must be >= 0, got {num_steps}.")
+        if not 0.0 <= class_dropout_prob <= 1.0:
+            raise ValueError(
+                f"class_dropout_prob must be in [0, 1], got {class_dropout_prob}."
+            )
+        self.dynamics = dynamics
+        self.readout = readout
+        self.decoder = decoder
+        self.class_dropout_prob = float(class_dropout_prob)
+        self.integration_time = float(integration_time)
+        self.num_steps = int(num_steps)
+        self.solver = solver
+
+    def _time_grid(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        return torch.linspace(
+            0.0, self.integration_time, self.num_steps + 1,
+            device=device, dtype=dtype,
+        )
+
+    def _sample_initial_state(
+        self,
+        num_samples: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        """Sample initial phases for main + driver uniformly from [-pi, pi)."""
+        dim = self.dynamics.state_dim
+        return (
+            torch.rand(num_samples, dim, device=device, dtype=dtype, generator=generator)
+            * (2.0 * torch.pi)
+            - torch.pi
+        )
+
+    def _class_drive(
+        self, class_id: Tensor, *, generator: torch.Generator | None = None
+    ) -> Tensor:
+        """Gather per-sample class drive, optionally zeroed by class dropout."""
+        drive = self.dynamics.K_drive[class_id]
+        if self.training and self.class_dropout_prob > 0.0:
+            keep = (
+                torch.rand(
+                    class_id.shape[0], device=class_id.device, generator=generator,
+                )
+                >= self.class_dropout_prob
+            )
+            drive = drive * keep.to(dtype=drive.dtype).view(-1, 1, 1)
+        return drive
+
+    def forward(
+        self,
+        class_id: Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        """Generate decoded samples for the given class labels.
+
+        Args:
+            class_id: Class labels shaped `(batch,)`, values in `[0, num_classes)`.
+            generator: Optional RNG for reproducible sampling.
+        """
+        param = next(self.parameters())
+        batch = int(class_id.shape[0])
+        initial_state = self._sample_initial_state(
+            batch, device=param.device, dtype=param.dtype, generator=generator,
+        )
+        if self.num_steps == 0:
+            final_state = initial_state
+        else:
+            drive = self._class_drive(class_id, generator=generator)
+            time_grid = self._time_grid(device=param.device, dtype=param.dtype)
+            states = odeint(
+                lambda t, state: self.dynamics(state, t, drive),
+                initial_state, time_grid,
+                method=self.solver,
+                options={"step_size": self.integration_time / self.num_steps},
+            )
+            final_state = states[-1]
+        main_phases = final_state[:, : self.dynamics.n]
+        return self.decoder(self.readout(main_phases))
+
+    @torch.no_grad()
+    def sample(
+        self,
+        class_id: Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
+        """Generate samples without gradients."""
+        was_training = self.training
+        self.eval()
+        try:
+            return self.forward(class_id, generator=generator)
+        finally:
+            self.train(was_training)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        name: str,
+        *,
+        device: str | torch.device | None = None,
+    ) -> ConditionalImplicitKuramotoGenerator:
+        """Load a released checkpoint by name (e.g. `imagenet64/n16384`)."""
+        if name not in _PRETRAINED:
+            raise ValueError(
+                f"Unknown pretrained name {name!r}. "
+                f"Available: {', '.join(PRETRAINED_NAMES)}."
+            )
+        from huggingface_hub import hf_hub_download
+
+        filename, family = _PRETRAINED[name]
+        path = hf_hub_download(_HF_REPO, filename)
+        # weights_only=True: the file is a remote pickle (RCE surface); the
+        # released payloads load cleanly under the safe unpickler.
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        builder = build_cifar10_model if family == "cifar10" else build_imagenet64_model
+        model = _build_from_config(builder, state["config"])
+        model.load_state_dict(state["model"])
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        return model.to(device)
+
+
+def prepare_class_ids_for_generation(
+    *,
+    num_samples: int,
+    num_classes_per_step: int,
+    num_total_classes: int,
+    device: torch.device | str = "cpu",
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Sample `num_classes_per_step` classes and tile them to fill `num_samples`.
+
+    Each chosen class gets `num_samples // num_classes_per_step` samples; the
+    first `num_samples % num_classes_per_step` chosen classes get one extra.
+    Used so each generation step covers few classes densely (enough per-class
+    samples for the drift target) rather than all classes too sparsely.
+    """
+    if not 1 <= num_classes_per_step <= num_total_classes:
+        raise ValueError(
+            "Need 1 <= num_classes_per_step <= num_total_classes, got "
+            f"{num_classes_per_step} and {num_total_classes}."
+        )
+    if num_classes_per_step > num_samples:
+        raise ValueError(
+            f"num_classes_per_step ({num_classes_per_step}) cannot exceed "
+            f"num_samples ({num_samples})."
+        )
+    chosen = torch.randperm(num_total_classes, device=device, generator=generator)[
+        :num_classes_per_step
+    ]
+    base = num_samples // num_classes_per_step
+    remainder = num_samples % num_classes_per_step
+    counts = torch.full(
+        (num_classes_per_step,), base, device=device, dtype=torch.long
+    )
+    counts[:remainder] += 1
+    return chosen.repeat_interleave(counts)
+
+
+def build_cifar10_model(
+    *,
+    n_oscillators: int = 4096,
+    n_conditional_oscillators: int = 8,
+    class_dropout_prob: float = 0.1,
+    num_steps: int = 25,
+    decoder_in_channels: int | None = None,
+    parameterization: Parameterization = "standard",
+    relativization: Relativization = "ref_oscillator",
+    encoding: Encoding = "sin_cos",
+    solver: Solver = "rk4",
+) -> ConditionalImplicitKuramotoGenerator:
+    """Build the CIFAR-10 class-conditional model used in the release."""
+    # sin_cos concatenates sin and cos (2 * n); raw/sin pass n features through.
+    feature_dim = (2 if encoding == "sin_cos" else 1) * int(n_oscillators)
+    decoder_in_height = 4
+    decoder_in_width = 4
+    if decoder_in_channels is None:
+        spatial_features = decoder_in_height * decoder_in_width
+        if feature_dim % spatial_features != 0:
+            raise ValueError(
+                f"feature_dim={feature_dim} must be divisible by "
+                f"{spatial_features} when decoder_in_channels is not set."
+            )
+        decoder_in_channels = feature_dim // spatial_features
+
+    dynamics = ConditionalKuramotoDynamics(
+        n_oscillators=int(n_oscillators),
+        n_conditional_oscillators=int(n_conditional_oscillators),
+        num_classes=10,
+        init_k_scale=1.0,
+        init_freq_scale=1.0,
+        parameterization=parameterization,
+    )
+    # Compile the velocity function: called 4 * num_steps times per integration
+    # with fixed shape (batch, n + n_cond), so Inductor fuses sin/cos +
+    # the matmuls + the einsum drive into a handful of kernels.
+    dynamics = torch.compile(dynamics)
+    readout = ReadoutTransform(
+        encoding=encoding,
+        relativization=relativization,
+    )
+    decoder = ResizeConvDecoder(
+        feature_dim=feature_dim,
+        output_dim=3 * 32 * 32,
+        in_channels=int(decoder_in_channels),
+        in_height=decoder_in_height,
+        in_width=decoder_in_width,
+        out_channels=3,
+        num_upsamples=3,
+        final_activation="tanh",
+        init_output_gain=0.5,
+    )
+    decoder = torch.compile(decoder)
+    return ConditionalImplicitKuramotoGenerator(
+        dynamics=dynamics,
+        readout=readout,
+        decoder=decoder,
+        class_dropout_prob=float(class_dropout_prob),
+        integration_time=1.0,
+        num_steps=int(num_steps),
+        solver=solver,
+    )
+
+
+def build_imagenet64_model(
+    *,
+    n_oscillators: int = 16384,
+    n_conditional_oscillators: int = 1,
+    class_dropout_prob: float = 0.1,
+    num_steps: int = 10,
+    decoder_in_channels: int | None = None,
+    parameterization: Parameterization = "mup",
+    relativization: Relativization = "ref_oscillator",
+) -> ConditionalImplicitKuramotoGenerator:
+    """Build the ImageNet-64 class-conditional model (1000 classes, 10-step euler)."""
+    feature_dim = 2 * int(n_oscillators)
+    decoder_in_height = 4
+    decoder_in_width = 4
+    if decoder_in_channels is None:
+        spatial_features = decoder_in_height * decoder_in_width
+        if feature_dim % spatial_features != 0:
+            raise ValueError(
+                "2 * n_oscillators must be divisible by "
+                f"{spatial_features} when decoder_in_channels is not set."
+            )
+        decoder_in_channels = feature_dim // spatial_features
+
+    dynamics = ConditionalKuramotoDynamics(
+        n_oscillators=int(n_oscillators),
+        n_conditional_oscillators=int(n_conditional_oscillators),
+        num_classes=1000,
+        init_k_scale=1.0,
+        init_freq_scale=1.0,
+        parameterization=parameterization,
+    )
+    dynamics = torch.compile(dynamics)
+    readout = ReadoutTransform(
+        encoding="sin_cos",
+        relativization=relativization,
+    )
+    decoder = ResizeConvDecoder(
+        feature_dim=feature_dim,
+        output_dim=3 * 64 * 64,
+        in_channels=int(decoder_in_channels),
+        in_height=decoder_in_height,
+        in_width=decoder_in_width,
+        out_channels=3,
+        num_upsamples=4,
+        final_activation="tanh",
+        init_output_gain=1.0,
+    )
+    decoder = torch.compile(decoder)
+    return ConditionalImplicitKuramotoGenerator(
+        dynamics=dynamics,
+        readout=readout,
+        decoder=decoder,
+        class_dropout_prob=float(class_dropout_prob),
+        integration_time=1.0,
+        num_steps=int(num_steps),
+        solver="euler",
+    )
+
+
+# Only this repo id changes when checkpoints move to the official hub; the
+# filenames and names below are stable.
+_HF_REPO = "un-ai/Un0"
+
+# name -> (filename, family)
+_PRETRAINED: dict[str, tuple[str, str]] = {
+    "cifar10/n1024":     ("cifar10_n1024.pt", "cifar10"),
+    "cifar10/n2048":     ("cifar10_n2048.pt", "cifar10"),
+    "cifar10/n4096":     ("cifar10_n4096.pt", "cifar10"),
+    "imagenet64/n6656":  ("imagenet64_n6656.pt", "imagenet64"),
+    "imagenet64/n10240": ("imagenet64_n10240.pt", "imagenet64"),
+    "imagenet64/n16384": ("imagenet64_n16384.pt", "imagenet64"),
+}
+PRETRAINED_NAMES = tuple(sorted(_PRETRAINED))
+
+
+def _build_from_config(
+    builder: Callable[..., ConditionalImplicitKuramotoGenerator],
+    config: dict,
+) -> ConditionalImplicitKuramotoGenerator:
+    # Pass only the arch keys the builder accepts (configs carry many training
+    # keys it does not); absent keys fall back to the builder's own defaults.
+    accepted = set(inspect.signature(builder).parameters)
+    kwargs = {key: value for key, value in config.items() if key in accepted}
+    return builder(**kwargs)

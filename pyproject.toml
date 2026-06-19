@@ -1,0 +1,124 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "un0"
+version = "0.1.0"
+description = "Kuramoto-based image generation"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "datasets>=3.0.0",
+    "huggingface_hub>=0.36.0",
+    "numpy>=1.24.0",
+    "Pillow>=9.0.0",
+    "torch>=2.11.0",
+    "torchdiffeq>=0.2.5",
+    "torchvision>=0.26.0",
+    "tqdm>=4.65.0",
+]
+
+[dependency-groups]
+test = [
+    "pytest>=8.0.0",
+]
+dev = [
+    {include-group = "test"},
+    "ruff>=0.14.5",
+]
+logging = [
+    "wandb>=0.20.0",
+]
+eval = [
+    "clean-fid>=0.1.35",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = { find = { where = ["src"] } }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[tool.ruff]
+extend = "ruff-base.toml"
+
+[tool.ruff.lint]
+extend-ignore = [
+    "EM101",
+    "EM102",
+    "TC002",
+    "TC003",
+    "TRY003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/data.py" = [
+    "PLC0415",
+    "PLR0913",
+]
+"src/inference.py" = [
+    "D103",
+]
+"src/metrics.py" = [
+    "PLC0415",
+    "PLR0913",
+]
+"src/losses.py" = [
+    "C901",
+    "D100",
+    "FBT001",
+    "FBT002",
+    "N806",
+    "PLR0912",
+    "PLR0913",
+    "PLR2004",
+]
+"src/model.py" = [
+    "D413",
+    "N806",
+    "PLC0415",
+    "PLR0913",
+    "PLR2004",
+]
+"src/train_cifar10.py" = [
+    "C901",
+    "PLC0415",
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+]
+"src/imagenet_data.py" = [
+    "PLR0913",
+]
+"src/train_imagenet.py" = [
+    "C901",
+    "PLC0415",
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+]
+"tests/*" = ["ALL"]
+"scripts/precompute_dino_features.py" = [
+    "D103",
+    "INP001",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--import-mode=importlib",
+]

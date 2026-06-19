@@ -1,0 +1,95 @@
+# Ruff configuration for Google Python style guide
+# https://google.github.io/styleguide/pyguide.html
+#
+# This is the base configuration for the repository. Child projects can extend this
+# by using: extend = "<relative path to uncommon>/ruff.toml"
+
+# Line length (Google style guide recommends 80, but allows up to 100)
+line-length = 80
+
+# Python target version
+target-version = "py311"
+
+# Exclude patterns
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+]
+
+# Enable formatting
+[format]
+# Use double quotes for strings (Google style guide)
+quote-style = "double"
+# Use spaces for indentation
+indent-style = "space"
+# Skip magic trailing comma
+skip-magic-trailing-comma = false
+# Line ending style
+line-ending = "auto"
+
+# Linting rules aligned with Google Python style guide
+[lint]
+# Enable all rules
+select = ["ALL"]
+# Ignore specific rules that might conflict or be too strict
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+    "T201",  # Print statements (acceptable in CLI scripts)
+    "COM812",  # Trailing comma missing
+    "ISC001",  # Implicitly concatenated string literals
+    "RUF001",  # Ambiguous Unicode character
+    "RUF002",  # Ambiguous Unicode character in docstring
+    "RUF003",  # Comment contains TODO
+    "B026",  # Comment contains FIXME (remapped from RUF004)
+    "RUF005",  # Collection literal contains duplicate
+    "RUF006",  # Asyncio function or method has no timeout
+    "RUF007",  # Function contains unused `self` argument
+    "RUF008",  # Function contains unused `cls` argument
+    "RUF009",  # Function contains unused function argument
+    "RUF010",  # Function contains unused variable
+    "B035",  # Function contains unused type: ignore comment (remapped from RUF011)
+    "RUF012",  # Mutable class attributes should be annotated with `ClassVar`
+    "UP007",   # Use `X | Y` instead of `Union[X, Y]` (Python < 3.10 compatibility)
+    "D203",  # One blank line required before class docstring (conflicts with D211)
+    "D213",  # Multi-line docstring summary should start at the second line (conflicts with D212)
+]
+
+# Import sorting (Google style guide order)
+[lint.isort]
+# Force single line imports
+force-single-line = false
+# Known first party packages (add your project name here)
+known-first-party = []
+# Section order: standard library, third party, first party, local
+force-sort-within-sections = true
+
+# Annotation rules
+[lint.flake8-annotations]
+# Allow `Any` for *args and **kwargs (common pattern for passthrough kwargs)
+allow-star-arg-any = true
+
+# PEP8 naming rules
+[lint.pep8-naming]
+# Allow PyTorch convention: import torch.nn.functional as F
+ignore-names = ["F"]
