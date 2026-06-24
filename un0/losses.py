@@ -196,7 +196,12 @@ class DINOFeatureExtractor(nn.Module):
     def __init__(self, *, antialias: bool = True) -> None:
         """Load and freeze the DINOv2 backbone."""
         super().__init__()
-        self.backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+        # Pinned to a specific dinov2 commit so the backbone weights and hubconf
+        # stay fixed across upstream changes (the repo publishes no release tags).
+        self.backbone = torch.hub.load(
+            "facebookresearch/dinov2:7764ea0f912e53c92e82eb78a2a1631e92725fc8",
+            "dinov2_vits14",
+        )
         self.register_buffer(
             "imagenet_mean",
             torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),

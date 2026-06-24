@@ -287,7 +287,7 @@ def train(args: argparse.Namespace) -> None:
         bank_path = Path(args.precomputed_dino_features)
         if not bank_path.is_file():
             raise FileNotFoundError(f"Precomputed bank not found: {bank_path}")
-        payload = torch.load(bank_path, map_location=device, weights_only=False)
+        payload = torch.load(bank_path, map_location=device, weights_only=True)
         bank_image_size = int(payload.get("image_size", IMAGE_SIZE))
         if bank_image_size != IMAGE_SIZE:
             raise ValueError(
@@ -305,8 +305,7 @@ def train(args: argparse.Namespace) -> None:
     global_step = 0
     resume_state: dict[str, Any] | None = None
     if args.resume is not None:
-        # weights_only=False: checkpoints hold optimizer/scheduler state, not just tensors.
-        resume_state = torch.load(args.resume, map_location=device, weights_only=False)
+        resume_state = torch.load(args.resume, map_location=device, weights_only=True)
         raw_model.load_state_dict(resume_state["model"])
         start_epoch = int(resume_state.get("epoch", 0)) + 1
         global_step = int(resume_state.get("global_step", 0))

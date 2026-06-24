@@ -22,7 +22,7 @@
 #   --fid-final-num-samples N  FID samples for the long runs. Default: 50000.
 #   --min-lr V / --max-lr V    Override the LR sweep range.
 #   --output-root PATH         Run-dir root. Default: outputs.
-#   --no-sync                  Skip `uv sync` (devbox already synced).
+#   --no-sync                  Skip `uv sync` (dependencies already synced).
 #   --dry-run                  Print the planned commands; don't launch.
 #   -h, --help                 Show this help.
 
@@ -211,7 +211,7 @@ for fid_path in sorted(glob.glob(os.path.join(sweep_root, "*", "fid.json"))):
         fid = float(json.load(open(fid_path))["fid"])
     except (OSError, KeyError, ValueError):
         continue
-    state = torch.load(ckpt, map_location="cpu", weights_only=False)
+    state = torch.load(ckpt, map_location="cpu", weights_only=True)
     lr = (state.get("config") or {}).get(cfg_key)
     if lr is None:
         continue

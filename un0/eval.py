@@ -48,7 +48,7 @@ def evaluate(args: argparse.Namespace) -> float:
     device = resolve_device("auto")
     disable_torchscript_gpu_fuser_on_blackwell()
 
-    state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    state = torch.load(args.checkpoint, map_location=device, weights_only=True)
     config = state.get("config") or {}
     # Checkpoints without these config keys were trained with "mup" +
     # "ref_oscillator"; fall back to those so they load correctly.

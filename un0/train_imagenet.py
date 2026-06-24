@@ -192,7 +192,7 @@ def train(args: argparse.Namespace) -> None:
     global_step = 0
     resume_state: dict[str, Any] | None = None
     if args.resume is not None:
-        resume_state = torch.load(args.resume, map_location=device, weights_only=False)
+        resume_state = torch.load(args.resume, map_location=device, weights_only=True)
         raw_model.load_state_dict(resume_state["model"])
         start_epoch = int(resume_state.get("epoch", 0)) + 1
         global_step = int(resume_state.get("global_step", 0))

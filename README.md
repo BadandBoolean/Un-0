@@ -263,3 +263,16 @@ to `outputs/dynamics/best_lr.json`, and each run's FID lands in its own
 `fid.json`. See [`ablation_study/`](ablation_study/) for the runner and
 LR-sweep launcher.
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Third-party components:
+
+- ImageNet preprocessing in `scripts/imagenet_preprocessing.py` is adapted from
+  [openai/guided-diffusion](https://github.com/openai/guided-diffusion)
+  (MIT, Copyright (c) 2021 OpenAI).
+- The DINOv2 backbone is loaded at runtime from
+  [facebookresearch/dinov2](https://github.com/facebookresearch/dinov2)
+  (Apache-2.0); not vendored here.
+

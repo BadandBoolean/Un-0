@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Kuramoto-based image generation"
 readme = "README.md"
 license = { text = "MIT" }
-authors = [{ name = "Unconventional AI" }]
+authors = [{ name = "Unconventional, Inc." }]
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "datasets>=3.0.0",
@@ -23,7 +23,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://unconv.ai"
-Repository = "https://github.com/unconv-ai/Un0"
+Repository = "https://github.com/unconv-ai/Un-0"
 
 [dependency-groups]
 test = [

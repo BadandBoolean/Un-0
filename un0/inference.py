@@ -62,7 +62,7 @@ def generate(args: argparse.Namespace) -> None:
     if args.pretrained is not None:
         model = ConditionalImplicitKuramotoGenerator.from_pretrained(args.pretrained, device=device)
     else:
-        state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        state = torch.load(args.checkpoint, map_location=device, weights_only=True)
         # Rebuild the architecture from the checkpoint's own config, selecting the
         # builder by --family. `build_from_config` passes only the arch keys each
         # builder accepts and lets absent keys fall back to the builder defaults.

@@ -24,7 +24,7 @@ the sin/cos readout to the decoder, `decoder_only_raw` feeds raw phases directly
 Phase 1 runs a short LR sweep per experiment (one LR per GPU via
 `lr_sweep.sh`) and ranks by FID; Phase 2 runs the best LR per experiment at
 full length, one experiment per GPU. Use `--dry-run` to print the commands
-without launching, and `--no-sync` if the devbox is already synced.
+without launching, and `--no-sync` if dependencies are already synced.
 
 ## Results
 
