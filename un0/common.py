@@ -29,9 +29,11 @@ def seed_everything(seed: int) -> None:
 
 
 def resolve_device(device: str) -> torch.device:
-    """Resolve `auto` to CUDA when available."""
+    """Resolve the requested device string to a torch.device, with "auto" detection."""
     if device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if accelerator := torch.accelerator.current_accelerator(check_available=True):
+            return accelerator
+        return torch.device("cpu")
     return torch.device(device)
 
 
