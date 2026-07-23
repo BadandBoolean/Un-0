@@ -439,7 +439,9 @@ def train(args: argparse.Namespace) -> None:
     # Persistent-crossbar checkpoints need the chain count to rebuild the
     # x_persist buffer with matching shape (it is one chain per batch lane).
     config["n_chains"] = int(args.batch_size)
-    dino = DINOFeatureExtractor().to(device)
+    # MPS (Apple Silicon) does not implement the antialiased bicubic kernel;
+    # disable it so training works on MPS without changing any other path.
+    dino = DINOFeatureExtractor(antialias=device.type != "mps").to(device)
     # Compile DINO's forward. Input shape is fixed by IMAGE_SIZE and
     # feature_batch_size, so Inductor compiles once and reuses. Backbone
     # params are frozen, so no recompilation on train/eval toggles.
