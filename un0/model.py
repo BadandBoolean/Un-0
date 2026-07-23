@@ -335,7 +335,14 @@ class ConditionalImplicitKuramotoGenerator(nn.Module):
         dtype: torch.dtype,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        """Sample initial phases for main + driver uniformly from [-pi, pi)."""
+        """Sample initial phases for main + driver uniformly from [-pi, pi).
+
+        Dynamics modules whose state is not purely phases (e.g. memristive
+        coupling states) override this by exposing `sample_initial_state`.
+        """
+        sampler = getattr(self.dynamics, "sample_initial_state", None)
+        if sampler is not None:
+            return sampler(num_samples, device=device, dtype=dtype, generator=generator)
         dim = self.dynamics.state_dim
         return (
             torch.rand(num_samples, dim, device=device, dtype=dtype, generator=generator)
@@ -391,6 +398,13 @@ class ConditionalImplicitKuramotoGenerator(nn.Module):
                 options={"step_size": self.integration_time / self.num_steps},
             )
             final_state = states[-1]
+        if self.training:
+            # Persistent-crossbar dynamics carry each training run's final
+            # coupling states over to the next run (physical memory); other
+            # dynamics don't define the hook. Evals never commit.
+            commit = getattr(self.dynamics, "commit_crossbar", None)
+            if commit is not None:
+                commit(final_state)
         main_phases = final_state[:, : self.dynamics.n]
         return self.decoder(self.readout(main_phases))
 

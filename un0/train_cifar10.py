@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib.util
 import os
 from pathlib import Path
@@ -31,6 +32,12 @@ from un0.losses import (
     PerClassQueue,
     conditional_drift_loss,
     gather_precomputed_dino_views,
+)
+from un0.memristor import (
+    KNOWM_W_SDC,
+    TAOX_SANDIA,
+    MemristorParams,
+    build_memristive_cifar10_model,
 )
 from un0.model import build_cifar10_model
 
@@ -117,6 +124,120 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("euler", "rk4"),
         default="euler",
         help="ODE solver for the dynamics rollout.",
+    )
+    parser.add_argument(
+        "--dynamics",
+        choices=("standard", "memristive"),
+        default="standard",
+        help=(
+            "Main-block coupling: 'standard' is the released learned-K model; "
+            "'memristive' couples oscillators through a Yakopcic memristor "
+            "crossbar evolving inside the ODE (state is O(batch * n^2) — use "
+            "small --n-oscillators/--batch-size). Ignores --parameterization."
+        ),
+    )
+    parser.add_argument(
+        "--memristor-eta",
+        type=float,
+        default=None,
+        help=(
+            "Memristor/oscillator timescale separation (memristive only). "
+            "Default: the preset's value (1e-3 for 'paper', 3e-8 for "
+            "'knowm-w', the latter derived from a 100 MHz oscillator and a "
+            "~100 us device write time)."
+        ),
+    )
+    parser.add_argument(
+        "--memristor-lambda-decay",
+        type=float,
+        default=None,
+        help=(
+            "Passive memristor decay rate toward OFF (memristive only). "
+            "Default: the preset's value (0.04 for 'paper', 0 for 'knowm-w' "
+            "— the datasheet's retention figure shows no decay)."
+        ),
+    )
+    parser.add_argument(
+        "--memristor-an",
+        type=float,
+        default=None,
+        help=(
+            "RESET switching rate An (memristive only). Default: the "
+            "preset's value (4000 for both; equal to Ap, since no rate "
+            "asymmetry is published for these devices). Setting An below Ap "
+            "engineers away the device's real SET/RESET imbalance — a "
+            "deviation from measured physics, so state it if you use it."
+        ),
+    )
+    parser.add_argument(
+        "--memristor-v-osc",
+        type=float,
+        default=None,
+        help=(
+            "Oscillator voltage amplitude driving the memristors (memristive "
+            "only). Default: just above the preset's SET threshold (0.18 for "
+            "'paper', 0.30 for 'knowm-w')."
+        ),
+    )
+    parser.add_argument(
+        "--memristor-drive-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier on the class-drive init (memristive only). ~10 makes "
+            "which pairs align during a run repeatable rather than "
+            "initial-phase luck, so Hebbian crossbar writes carry signal."
+        ),
+    )
+    parser.add_argument(
+        "--memristor-preset",
+        choices=("paper", "knowm-w", "taox"),
+        default="paper",
+        help=(
+            "Device parameter set (memristive only). 'paper' is the "
+            "published Yakopcic fit already in MemristorParams; 'knowm-w' "
+            "uses Knowm W+SDC datasheet values (thresholds +0.26/-0.11 V); "
+            "'taox' uses the Sandia TaOx ReRAM extraction from Yakopcic et "
+            "al. 2020 (thresholds +0.91/-1.425 V, Ap/An 72.5/21, SET-"
+            "dominant). --memristor-eta/-lambda-decay/-an override on top."
+        ),
+    )
+    parser.add_argument(
+        "--memristor-signed-coupling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Memristive only. Two devices per oscillator pair (differential "
+            "pair): coupling is G(plus) - G(minus), so it can attract or "
+            "repel. Default is one device per pair, attraction only."
+        ),
+    )
+    parser.add_argument(
+        "--memristor-disturb-anneal",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Memristive only. Scale the memristor switching rate by the LR "
+            "schedule's multiplier each step, so gradient programming and "
+            "read disturb shrink together instead of drift dominating as "
+            "the LR decays."
+        ),
+    )
+    parser.add_argument(
+        "--crossbar",
+        choices=("reflash", "persistent", "device"),
+        default="reflash",
+        help=(
+            "Memristive only. 'reflash' resets the crossbar to the learned "
+            "x0 table before every run. 'persistent' deletes that table: one "
+            "crossbar chain per batch lane lives in the circuit, starts at "
+            "0.5 once, and inherits each training run's final states — the "
+            "coupling table is grown by device physics. 'device' makes the "
+            "devices the weight store: one trainable crossbar, never "
+            "re-flashed; gradients program it and each training run's "
+            "batch-mean drift stays written in. Non-reflash modes are "
+            "single-process only."
+        ),
     )
     parser.add_argument(
         "--freeze-dynamics",
@@ -257,21 +378,67 @@ def train(args: argparse.Namespace) -> None:
         include_sample_id=use_precomputed,
     )
 
-    raw_model = build_cifar10_model(
-        n_oscillators=int(args.n_oscillators),
-        n_conditional_oscillators=int(args.n_conditional_oscillators),
-        class_dropout_prob=float(args.class_dropout_prob),
-        num_steps=int(args.num_steps),
-        decoder_in_channels=args.decoder_in_channels,
-        parameterization=str(args.parameterization),
-        relativization=str(args.relativization),
-        encoding=str(args.encoding),
-        solver=str(args.solver),
-    ).to(device)
+    if args.dynamics == "memristive":
+        raw_model = build_memristive_cifar10_model(
+            n_oscillators=int(args.n_oscillators),
+            n_conditional_oscillators=int(args.n_conditional_oscillators),
+            class_dropout_prob=float(args.class_dropout_prob),
+            num_steps=int(args.num_steps),
+            decoder_in_channels=args.decoder_in_channels,
+            relativization=str(args.relativization),
+            encoding=str(args.encoding),
+            solver=str(args.solver),
+            # Preset supplies the physics; CLI flags override only when given,
+            # so a preset's measured values are never silently clobbered.
+            memristor_params=dataclasses.replace(
+                {"knowm-w": KNOWM_W_SDC, "taox": TAOX_SANDIA}.get(
+                    args.memristor_preset, MemristorParams()
+                ),
+                **{
+                    name: float(value)
+                    for name, value in (
+                        ("eta", args.memristor_eta),
+                        ("lambda_decay", args.memristor_lambda_decay),
+                        ("An", args.memristor_an),
+                    )
+                    if value is not None
+                },
+            ),
+            v_osc=float(
+                args.memristor_v_osc
+                if args.memristor_v_osc is not None
+                else {"knowm-w": 0.35, "taox": 1.5}.get(args.memristor_preset, 0.18)
+            ),
+            init_drive_scale=float(args.memristor_drive_scale),
+            signed_coupling=bool(args.memristor_signed_coupling),
+            crossbar=str(args.crossbar),
+            n_chains=int(args.batch_size),
+        ).to(device)
+        if args.crossbar != "reflash" and distributed:
+            raise ValueError(
+                f"--crossbar {args.crossbar} is single-process only: DDP's "
+                "buffer broadcast / diverging per-rank commits would corrupt "
+                "the stored crossbar."
+            )
+    else:
+        raw_model = build_cifar10_model(
+            n_oscillators=int(args.n_oscillators),
+            n_conditional_oscillators=int(args.n_conditional_oscillators),
+            class_dropout_prob=float(args.class_dropout_prob),
+            num_steps=int(args.num_steps),
+            decoder_in_channels=args.decoder_in_channels,
+            parameterization=str(args.parameterization),
+            relativization=str(args.relativization),
+            encoding=str(args.encoding),
+            solver=str(args.solver),
+        ).to(device)
     if args.freeze_dynamics:
         for param in raw_model.dynamics.parameters():
             param.requires_grad_(False)  # noqa: FBT003
     config = vars(args).copy()
+    # Persistent-crossbar checkpoints need the chain count to rebuild the
+    # x_persist buffer with matching shape (it is one chain per batch lane).
+    config["n_chains"] = int(args.batch_size)
     dino = DINOFeatureExtractor().to(device)
     # Compile DINO's forward. Input shape is fixed by IMAGE_SIZE and
     # feature_batch_size, so Inductor compiles once and reuses. Backbone
@@ -326,6 +493,12 @@ def train(args: argparse.Namespace) -> None:
         warmup_fraction=WARMUP_FRACTION,
     )
     scaler = torch.amp.GradScaler("cuda") if args.precision == "fp16" else None
+
+    # Disturb annealing: the training loop scales the memristor switching
+    # rate by the LR multiplier after each scheduler step.
+    anneal_dynamics = None
+    if args.dynamics == "memristive" and args.memristor_disturb_anneal:
+        anneal_dynamics = raw_model.dynamics
 
     if resume_state is not None:
         optimizer.load_state_dict(resume_state["optimizer"])
@@ -514,6 +687,8 @@ def train(args: argparse.Namespace) -> None:
                 grad_norm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                 optimizer.step()
             scheduler.step()
+            if anneal_dynamics is not None:
+                anneal_dynamics.eta_scale.fill_(scheduler.get_last_lr()[0] / float(args.lr))
             global_step += 1
 
             if is_main and global_step % LOG_EVERY == 0:

@@ -89,6 +89,14 @@ extend-ignore = [
     "PLR0913",
     "PLR2004",
 ]
+"un0/memristor.py" = [
+    "D413",
+    "N803",
+    "N806",
+    "PLR0913",
+    "PLR2004",
+    "SIM300",
+]
 "un0/model.py" = [
     "D413",
     "N806",

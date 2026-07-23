@@ -12,3 +12,6 @@ logs/
 wandb/
 profile/
 **/.ipynb_checkpoints/
+*.pt
+*.log
+*.DS_Store
